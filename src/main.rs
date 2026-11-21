@@ -3,7 +3,7 @@ mod output;
 mod pipeline;
 
 use input::{Files, Window, scan, unique_rows};
-use pipeline::{Dimensions, aggregate, load_clicks, load_events, sort_inputs};
+use pipeline::{Dimensions, aggregate, load_clicks, load_events};
 use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -76,15 +76,13 @@ fn main() -> Result<()> {
         _ => {
             let dimensions = Dimensions::load(&links, &products, &campaigns);
             report("dimensions");
-            let (mut events, mut clicks) = rayon::join(
+            let (events, clicks) = rayon::join(
                 || load_events(&events, &dimensions, &window),
                 || load_clicks(&clicks, &dimensions, &window),
             );
             report("parse_dedup_validate");
-            sort_inputs(&mut events, &mut clicks);
-            report("sort");
-            let (users, campaigns) = aggregate(&events, &clicks);
-            report("aggregate");
+            let (users, campaigns) = aggregate(events, clicks);
+            report("group_sort_aggregate");
             output::write_tables(&out, &users, campaigns, &dimensions)?;
             report("parquet");
         }

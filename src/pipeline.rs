@@ -1,13 +1,14 @@
 use crate::input::{DAY, Files, WEEK, Window, fields, number, timestamp, unique_rows};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
+use std::hash::BuildHasher;
 
 const SESSION_GAP: i64 = 1_800_000;
 const ORGANIC: u32 = 0;
 const NO_PURCHASE: u32 = u32::MAX;
 
 pub struct Dimensions<'a> {
-    people: FxHashMap<&'a [u8], &'a [u8]>,
+    people: People<'a>,
     products: FxHashMap<&'a [u8], u32>,
     unknown: u32,
     pub categories: Vec<&'a [u8]>,
@@ -45,7 +46,11 @@ impl<'a> Dimensions<'a> {
     }
 
     fn canonical(&self, id: &'a [u8]) -> &'a [u8] {
-        self.people.get(id).copied().unwrap_or(id)
+        self.people
+            .aliases
+            .get(id)
+            .and_then(|&root| self.people.names[root])
+            .unwrap_or(id)
     }
 }
 
@@ -84,27 +89,33 @@ impl DisjointSet {
     }
 }
 
-fn link_people(files: &Files) -> FxHashMap<&[u8], &[u8]> {
-    let mut ids = FxHashMap::default();
+struct People<'a> {
+    aliases: FxHashMap<&'a [u8], usize>,
+    names: Vec<Option<&'a [u8]>>,
+}
+
+fn link_people(files: &Files) -> People<'_> {
+    // Estimate capacity from input bytes to reduce resizing on large link files.
+    let mut aliases = FxHashMap::with_capacity_and_hasher(files.bytes() / 24, Default::default());
     let mut sets = DisjointSet::default();
     for [a, b] in files.rows().filter_map(fields::<2>) {
         if !a.is_empty() && !b.is_empty() {
-            let a = *ids.entry(a).or_insert_with(|| sets.add());
-            let b = *ids.entry(b).or_insert_with(|| sets.add());
+            let a = *aliases.entry(a).or_insert_with(|| sets.add());
+            let b = *aliases.entry(b).or_insert_with(|| sets.add());
             sets.join(a, b);
         }
     }
 
-    let mut names = vec![None; ids.len()];
-    for (&id, &index) in &ids {
-        let name = &mut names[sets.root(index)];
+    let mut names = vec![None; aliases.len()];
+    for (&id, index) in &mut aliases {
+        *index = sets.root(*index);
+        let name = &mut names[*index];
         *name = Some(name.map_or(id, |old: &[u8]| old.min(id)));
     }
-    ids.into_iter()
-        .map(|(id, index)| (id, names[sets.root(index)].unwrap()))
-        .collect()
+    People { aliases, names }
 }
 
+#[derive(Clone, Copy)]
 pub struct Event<'a> {
     person: &'a [u8],
     time: i64,
@@ -112,6 +123,7 @@ pub struct Event<'a> {
     category: u32,
 }
 
+#[derive(Clone, Copy)]
 pub struct Click<'a> {
     person: &'a [u8],
     id: &'a [u8],
@@ -124,40 +136,43 @@ pub fn load_events<'a>(
     dimensions: &Dimensions<'a>,
     window: &Window,
 ) -> Vec<Event<'a>> {
-    unique_rows::<_, _, 7>(files, Some(3), |row, _| {
-        let [_, person, time, ingest, kind, product, price] = fields::<7>(row)?;
-        if person.is_empty() || product.is_empty() {
-            return None;
-        }
-        let time = timestamp(time)?;
-        if !(window.start..window.end).contains(&time) || timestamp(ingest)? - time > DAY {
-            return None;
-        }
-        let (price, category) = match kind {
-            b"view" | b"cart" => (0, NO_PURCHASE),
-            b"purchase" => {
-                let price = number(price, 10_000_000)?;
-                if price == 0 {
-                    return None;
-                }
-                (
-                    price as u32,
-                    dimensions
-                        .products
-                        .get(product)
-                        .copied()
-                        .unwrap_or(dimensions.unknown),
-                )
+    unique_rows::<_, _, 7>(
+        files,
+        Some(3),
+        |[_, person, time, _, kind, product, price], ingest| {
+            if person.is_empty() || product.is_empty() {
+                return None;
             }
-            _ => return None,
-        };
-        Some(Event {
-            person: dimensions.canonical(person),
-            time,
-            price,
-            category,
-        })
-    })
+            let time = timestamp(time)?;
+            if !(window.start..window.end).contains(&time) || ingest - time > DAY {
+                return None;
+            }
+            let (price, category) = match kind {
+                b"view" | b"cart" => (0, NO_PURCHASE),
+                b"purchase" => {
+                    let price = number(price, 10_000_000)?;
+                    if price == 0 {
+                        return None;
+                    }
+                    (
+                        price as u32,
+                        dimensions
+                            .products
+                            .get(product)
+                            .copied()
+                            .unwrap_or(dimensions.unknown),
+                    )
+                }
+                _ => return None,
+            };
+            Some(Event {
+                person: dimensions.canonical(person),
+                time,
+                price,
+                category,
+            })
+        },
+    )
 }
 
 pub fn load_clicks<'a>(
@@ -165,8 +180,7 @@ pub fn load_clicks<'a>(
     dimensions: &Dimensions<'a>,
     window: &Window,
 ) -> Vec<Click<'a>> {
-    unique_rows::<_, _, 4>(files, None, |row, id| {
-        let [_, person, campaign, time] = fields::<4>(row)?;
+    unique_rows::<_, _, 4>(files, None, |[id, person, campaign, time], _| {
         if person.is_empty() {
             return None;
         }
@@ -210,44 +224,51 @@ struct Session {
     revenue: i64,
 }
 
-pub fn sort_inputs(events: &mut [Event<'_>], clicks: &mut [Click<'_>]) {
-    rayon::join(
-        || events.par_sort_unstable_by(|a, b| a.person.cmp(b.person).then(a.time.cmp(&b.time))),
-        || {
-            clicks.par_sort_unstable_by(|a, b| {
-                a.person
-                    .cmp(b.person)
-                    .then(a.time.cmp(&b.time))
-                    .then_with(|| b.id.cmp(a.id))
-            })
-        },
-    );
+const PERSON_PARTITIONS: usize = 128;
+
+fn by_person<T: Copy + Send + Sync>(
+    rows: &[T],
+    hash: impl Fn(&T) -> u64 + Sync,
+) -> Vec<Vec<Vec<T>>> {
+    let amount = rows.len().div_ceil(rayon::current_num_threads() * 3).max(1);
+    let batches: Vec<_> = rows
+        .par_chunks(amount)
+        .map(|chunk| {
+            let mut partitions = vec![Vec::new(); PERSON_PARTITIONS];
+            for &row in chunk {
+                let bucket = (hash(&row) >> 32) as usize & (PERSON_PARTITIONS - 1);
+                partitions[bucket].push(row);
+            }
+            partitions
+        })
+        .collect();
+    let mut partitions: Vec<_> = (0..PERSON_PARTITIONS)
+        .map(|_| Vec::with_capacity(batches.len()))
+        .collect();
+    for batch in batches {
+        for (partition, rows) in partitions.iter_mut().zip(batch) {
+            if !rows.is_empty() {
+                partition.push(rows);
+            }
+        }
+    }
+    partitions
 }
 
 pub fn aggregate<'a>(
-    events: &[Event<'a>],
-    clicks: &[Click<'a>],
+    events: Vec<Event<'a>>,
+    clicks: Vec<Click<'a>>,
 ) -> (Vec<UserDay<'a>>, CampaignTotals) {
-    let rows_per_task = (events.len() / (rayon::current_num_threads() * 8)).max(1024);
-    let mut chunks = Vec::new();
-    let mut begin = 0;
-    while begin < events.len() {
-        let nominal_end = (begin + rows_per_task).min(events.len());
-        let last_person = events[nominal_end - 1].person;
-        let end = nominal_end
-            + events[nominal_end..].partition_point(|event| event.person == last_person);
-        let first_person = events[begin].person;
-        let click_begin = clicks.partition_point(|click| click.person < first_person);
-        let click_end = clicks.partition_point(|click| click.person <= last_person);
-        chunks.push((&events[begin..end], &clicks[click_begin..click_end]));
-        begin = end;
-    }
-
+    let (events, clicks) = rayon::join(
+        move || by_person(&events, |event| FxBuildHasher.hash_one(event.person)),
+        move || by_person(&clicks, |click| FxBuildHasher.hash_one(click.person)),
+    );
     let mut all_users = Vec::new();
     let mut all_campaigns = CampaignTotals::default();
-    let parts: Vec<_> = chunks
+    let parts: Vec<_> = events
         .into_par_iter()
-        .map(|(events, clicks)| aggregate_chunk(events, clicks))
+        .zip(clicks)
+        .map(|(events, clicks)| aggregate_partition(events, clicks))
         .collect();
     for (mut users, campaigns) in parts {
         all_users.append(&mut users);
@@ -262,22 +283,88 @@ pub fn aggregate<'a>(
     (all_users, all_campaigns)
 }
 
-fn aggregate_chunk<'a>(
-    events: &[Event<'a>],
-    mut clicks: &[Click<'a>],
+#[derive(Default)]
+struct Group {
+    event_count: usize,
+    click_count: usize,
+    event_end: usize,
+    click_end: usize,
+}
+
+fn aggregate_partition<'a>(
+    event_batches: Vec<Vec<Event<'a>>>,
+    click_batches: Vec<Vec<Click<'a>>>,
 ) -> (Vec<UserDay<'a>>, CampaignTotals) {
     let mut users = Vec::new();
     let mut campaigns = CampaignTotals::default();
+    let Some(&sample) = event_batches.first().and_then(|rows| rows.first()) else {
+        return (users, campaigns);
+    };
+
+    // Count each person's rows, then scatter into contiguous ranges. Only timestamps
+    // within a person need sorting, and click-only people produce no output.
+    let count = event_batches.iter().map(Vec::len).sum();
+    let mut ids = FxHashMap::default();
+    let mut groups = Vec::new();
+    let mut event_indices = Vec::with_capacity(count);
+    for event in event_batches.iter().flatten() {
+        let index = *ids.entry(event.person).or_insert_with(|| {
+            let index = groups.len();
+            groups.push(Group::default());
+            index
+        });
+        groups[index].event_count += 1;
+        event_indices.push(index);
+    }
+    let mut click_indices = Vec::new();
+    for click in click_batches.iter().flatten() {
+        let index = ids.get(click.person).copied();
+        if let Some(index) = index {
+            groups[index].click_count += 1;
+        }
+        click_indices.push(index);
+    }
+    drop(ids);
+
+    let (mut event_count, mut click_count) = (0, 0);
+    for group in &mut groups {
+        group.event_end = event_count;
+        group.click_end = click_count;
+        event_count += group.event_count;
+        click_count += group.click_count;
+    }
+
+    let mut events = vec![sample; event_count];
+    for (event, index) in event_batches.into_iter().flatten().zip(event_indices) {
+        let group = &mut groups[index];
+        events[group.event_end] = event;
+        group.event_end += 1;
+    }
+    let mut clicks = vec![
+        Click {
+            person: b"",
+            id: b"",
+            time: 0,
+            campaign: ORGANIC
+        };
+        click_count
+    ];
+    for (click, index) in click_batches.into_iter().flatten().zip(click_indices) {
+        if let Some(index) = index {
+            let group = &mut groups[index];
+            clicks[group.click_end] = click;
+            group.click_end += 1;
+        }
+    }
+
     let mut sessions = Vec::new();
     let mut categories = FxHashMap::default();
     let mut intervals = FxHashMap::default();
-    for person_events in events.chunk_by(|a, b| a.person == b.person) {
-        let person = person_events[0].person;
-        let skip = clicks.partition_point(|click| click.person < person);
-        clicks = &clicks[skip..];
-        let n = clicks.partition_point(|click| click.person == person);
-        let (person_clicks, rest) = clicks.split_at(n);
-        clicks = rest;
+    for group in groups {
+        let person_events = &mut events[group.event_end - group.event_count..group.event_end];
+        let person_clicks = &mut clicks[group.click_end - group.click_count..group.click_end];
+        person_events.sort_unstable_by_key(|event| event.time);
+        person_clicks.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| b.id.cmp(a.id)));
 
         sessionize(person_events, &mut users, &mut sessions, &mut categories);
         credit(&sessions, person_clicks, &mut campaigns);
