@@ -1,0 +1,55 @@
+name: Linux verification and benchmark
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    env:
+      NCPU: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build native release binary
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal
+          cargo +1.92.0 build --locked --release
+      - name: Check the edge-case fixtures
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+          .venv/bin/python scripts/run_fixtures.py fixtures -- target/release/shopping-sessions
+      - name: Generate the public dev set and the practice-sized benchmark
+        run: |
+          track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          mkdir -p "$RUNNER_TEMP/challenge"
+          cd "$RUNNER_TEMP/challenge"
+          curl --fail --silent --show-error --location --retry 3 "$track/generator.zip" -o generator.zip
+          curl --fail --silent --show-error --location --retry 3 "$track/dev-answer.zip" -o dev-answer.zip
+          unzip -q generator.zip
+          unzip -q dev-answer.zip
+          cargo +1.92.0 build --locked --release --manifest-path generator/Cargo.toml
+          generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --threads 4 --output dev
+          generator/target/release/generate --seed 1 --events 20000000 --clicks 5000000 --threads 4 --output practice
+      - name: Check scorer container against the public dev answer
+        run: |
+          make build
+          CPUS=4 MEM=10g scripts/docker_run.sh "$RUNNER_TEMP/challenge/dev" "$RUNNER_TEMP/challenge/container-out"
+          .venv/bin/python scripts/compare.py "$RUNNER_TEMP/challenge/container-out" "$RUNNER_TEMP/challenge/dev-answer"
+      - name: Benchmark the native Linux process
+        run: |
+          set -o pipefail
+          {
+            printf '### Linux x86-64 practice dataset\n\n'
+            printf 'Four workers on a GitHub-hosted runner.\n\n'
+            printf '\x60\x60\x60text\n'
+            lscpu | awk -F: '/^Model name:|^Architecture:|^CPU\(s\):/{print}'
+            .venv/bin/python scripts/benchmark.py "$RUNNER_TEMP/challenge/practice" --threads 4 --runs 3
+            printf '\x60\x60\x60\n'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
