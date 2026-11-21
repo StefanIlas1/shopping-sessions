@@ -5,11 +5,14 @@ It uses the organizer's DuckDB starter fixture and comparison scripts and writes
 both Parquet tables directly from a native binary.
 
 The pipeline reads newline-aligned file chunks, partitions syntactically valid
-rows by ID, and keeps the earliest ingest timestamp before validating events.
-It resolves linked users through a disjoint-set forest and sorts valid events
-and clicks by person and time. Campaign assists count session starts in merged
-seven-day campaign intervals. Last-click credit uses a separate chronological
-pass.
+rows by ID, and selects the earliest event version even when it has invalid
+fields. Short ASCII IDs use a lossless integer key. Other IDs use their original
+bytes. Deduplicated rows move directly into person partitions. For dense
+activity, half-hour buckets preserve the timestamps needed to decide session
+boundaries and carry the event counts and purchase totals. Sparse activity
+uses per-person timestamp sorting. Campaign assists count session starts in
+merged seven-day campaign intervals. Last-click credit uses a separate
+chronological pass.
 
 ## Scorer container
 

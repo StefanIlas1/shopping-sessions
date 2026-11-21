@@ -4,7 +4,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 use std::fs::{self, File};
-use std::hash::BuildHasher;
+use std::hash::{BuildHasher, Hash};
 use std::io;
 use std::path::Path;
 
@@ -147,20 +147,36 @@ pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     (column == N).then_some(result)
 }
 
-struct Candidate<'a, T> {
-    id: &'a [u8],
-    hash: u64,
+// Nine ASCII bytes fit in 63 bits. A length bit keeps prefixes and embedded
+// zeroes distinct. IDs outside that representation use their original bytes.
+#[inline]
+fn packed_id(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() > 9 {
+        return None;
+    }
+    let mut key = 1;
+    for &byte in bytes {
+        if !byte.is_ascii() {
+            return None;
+        }
+        key = (key << 7) | u64::from(byte);
+    }
+    Some(key)
+}
+
+struct Candidate<K, T> {
+    id: K,
     ingest: i64,
     value: Option<T>,
 }
 
-type CandidatePartitions<'a, T> = Vec<Vec<Candidate<'a, T>>>;
+type CandidatePartitions<K, T> = Vec<Vec<Candidate<K, T>>>;
 
 pub fn unique_rows<'a, T, F, const N: usize>(
     files: &'a Files,
     ingest_col: Option<usize>,
     visit: F,
-) -> Vec<T>
+) -> Vec<Vec<T>>
 where
     T: Send,
     F: Fn([&'a [u8]; N], i64) -> Option<T> + Send + Sync,
@@ -170,16 +186,17 @@ where
         .len()
         .div_ceil(rayon::current_num_threads() * 3)
         .max(1);
-    let batches: Vec<CandidatePartitions<'a, T>> = chunks
+    let batches: Vec<_> = chunks
         .par_chunks(chunks_per_task)
         .map(|batch| {
-            let mut local: CandidatePartitions<'a, T> =
-                (0..PARTITIONS).map(|_| Vec::new()).collect();
+            let mut packed: CandidatePartitions<u64, T> = empty_partitions();
+            let mut wide: CandidatePartitions<&[u8], T> = empty_partitions();
             for line in batch.iter().flat_map(|chunk| lines(chunk)) {
                 let Some(row) = fields::<N>(line) else {
                     continue;
                 };
-                if row[0].is_empty() {
+                let id = row[0];
+                if id.is_empty() {
                     continue;
                 }
                 let ingest = match ingest_col {
@@ -189,20 +206,38 @@ where
                     },
                     None => 0,
                 };
-                let hash = FxBuildHasher.hash_one(row[0]);
-                let bucket = (hash >> 32) as usize & (PARTITIONS - 1);
-                local[bucket].push(Candidate {
-                    id: row[0],
-                    hash,
-                    ingest,
-                    // Preserve invalid earlier copies in the minimum-ingest reduction.
-                    value: visit(row, ingest),
-                });
+                // Preserve invalid earlier copies in the minimum-ingest reduction.
+                let value = visit(row, ingest);
+                if let Some(id) = packed_id(id) {
+                    let bucket = id_partition(id);
+                    packed[bucket].push(Candidate { id, ingest, value });
+                } else {
+                    let bucket = id_partition(id);
+                    wide[bucket].push(Candidate { id, ingest, value });
+                }
             }
-            local
+            (packed, wide)
         })
         .collect();
 
+    let (packed, wide): (Vec<_>, Vec<_>) = batches.into_iter().unzip();
+    let (mut packed, wide) = rayon::join(|| merge_batches(packed), || merge_batches(wide));
+    packed.extend(wide);
+    packed
+}
+
+fn empty_partitions<T>() -> Vec<Vec<T>> {
+    (0..PARTITIONS).map(|_| Vec::new()).collect()
+}
+
+#[inline]
+fn id_partition<K: Hash>(id: K) -> usize {
+    (FxBuildHasher.hash_one(id) >> 32) as usize & (PARTITIONS - 1)
+}
+
+fn merge_batches<K: Hash + Eq + Send, T: Send>(
+    batches: Vec<CandidatePartitions<K, T>>,
+) -> Vec<Vec<T>> {
     let mut partitions: Vec<_> = (0..PARTITIONS)
         .map(|_| Vec::with_capacity(batches.len()))
         .collect();
@@ -213,35 +248,25 @@ where
             }
         }
     }
-
-    let groups: Vec<Vec<T>> = partitions
+    partitions
         .into_par_iter()
+        .filter(|partition| !partition.is_empty())
         .map(deduplicate_partition)
-        .collect();
-    let mut result = Vec::with_capacity(groups.iter().map(Vec::len).sum());
-    for mut group in groups {
-        result.append(&mut group);
-    }
-    result
+        .collect()
 }
 
-fn deduplicate_partition<T>(mut parts: CandidatePartitions<'_, T>) -> Vec<T> {
+fn deduplicate_partition<K: Hash + Eq, T>(mut parts: CandidatePartitions<K, T>) -> Vec<T> {
     let count: usize = parts.iter().map(Vec::len).sum();
-    if count == 0 {
-        return Vec::new();
-    }
-
-    // Parts already own every candidate. Store references in the probe table so
-    // selecting a winner does not copy fields into another hash table.
+    // Parts own every candidate. The probe table only points to the winning record.
     let slots = (count + count.div_ceil(3)).next_power_of_two();
-    let mut table: Vec<Option<&mut Candidate<'_, T>>> = (0..slots).map(|_| None).collect();
+    let mut table: Vec<Option<&mut Candidate<K, T>>> = (0..slots).map(|_| None).collect();
     for candidate in parts.iter_mut().flatten() {
-        let mut index = candidate.hash as usize & (slots - 1);
+        let mut index = FxBuildHasher.hash_one(&candidate.id) as usize & (slots - 1);
         loop {
             let slot = &mut table[index];
             match slot.as_deref() {
                 None => *slot = Some(candidate),
-                Some(winner) if winner.hash == candidate.hash && winner.id == candidate.id => {
+                Some(winner) if winner.id == candidate.id => {
                     if candidate.ingest < winner.ingest {
                         *slot = Some(candidate);
                     }
@@ -325,4 +350,26 @@ pub fn timestamp(bytes: &[u8]) -> Option<i64> {
     }
     let days = NaiveDate::from_ymd_opt(year, month, day)?.to_epoch_days();
     Some(i64::from(days) * DAY + (hours * 3600 + minutes * 60 + seconds) * 1000 - offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::packed_id;
+
+    #[test]
+    fn packed_ids_keep_length_case_and_zero_bytes() {
+        let keys = [
+            b"abc".as_slice(),
+            b"abc\0",
+            b"\0abc",
+            b"Abc",
+            b"123456780",
+            b"123456781",
+        ];
+        let packed: std::collections::HashSet<_> =
+            keys.iter().map(|key| packed_id(key).unwrap()).collect();
+        assert_eq!(packed.len(), keys.len());
+        assert_eq!(packed_id(b"1234567890"), None);
+        assert_eq!(packed_id("caf\u{e9}".as_bytes()), None);
+    }
 }

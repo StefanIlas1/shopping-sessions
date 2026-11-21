@@ -135,7 +135,7 @@ pub fn load_events<'a>(
     files: &'a Files,
     dimensions: &Dimensions<'a>,
     window: &Window,
-) -> Vec<Event<'a>> {
+) -> Vec<Vec<Event<'a>>> {
     unique_rows::<_, _, 7>(
         files,
         Some(3),
@@ -179,7 +179,7 @@ pub fn load_clicks<'a>(
     files: &'a Files,
     dimensions: &Dimensions<'a>,
     window: &Window,
-) -> Vec<Click<'a>> {
+) -> Vec<Vec<Click<'a>>> {
     unique_rows::<_, _, 4>(files, None, |[id, person, campaign, time], _| {
         if person.is_empty() {
             return None;
@@ -226,16 +226,14 @@ struct Session {
 
 const PERSON_PARTITIONS: usize = 128;
 
-fn by_person<T: Copy + Send + Sync>(
-    rows: &[T],
-    hash: impl Fn(&T) -> u64 + Sync,
-) -> Vec<Vec<Vec<T>>> {
+fn by_person<T: Send>(rows: Vec<Vec<T>>, hash: impl Fn(&T) -> u64 + Sync) -> Vec<Vec<Vec<T>>> {
     let amount = rows.len().div_ceil(rayon::current_num_threads() * 3).max(1);
     let batches: Vec<_> = rows
-        .par_chunks(amount)
+        .into_par_iter()
+        .chunks(amount)
         .map(|chunk| {
-            let mut partitions = vec![Vec::new(); PERSON_PARTITIONS];
-            for &row in chunk {
+            let mut partitions: Vec<Vec<T>> = (0..PERSON_PARTITIONS).map(|_| Vec::new()).collect();
+            for row in chunk.into_iter().flatten() {
                 let bucket = (hash(&row) >> 32) as usize & (PERSON_PARTITIONS - 1);
                 partitions[bucket].push(row);
             }
@@ -256,12 +254,12 @@ fn by_person<T: Copy + Send + Sync>(
 }
 
 pub fn aggregate<'a>(
-    events: Vec<Event<'a>>,
-    clicks: Vec<Click<'a>>,
+    events: Vec<Vec<Event<'a>>>,
+    clicks: Vec<Vec<Click<'a>>>,
 ) -> (Vec<UserDay<'a>>, CampaignTotals) {
     let (events, clicks) = rayon::join(
-        move || by_person(&events, |event| FxBuildHasher.hash_one(event.person)),
-        move || by_person(&clicks, |click| FxBuildHasher.hash_one(click.person)),
+        move || by_person(events, |event| FxBuildHasher.hash_one(event.person)),
+        move || by_person(clicks, |click| FxBuildHasher.hash_one(click.person)),
     );
     let mut all_users = Vec::new();
     let mut all_campaigns = CampaignTotals::default();
@@ -363,7 +361,6 @@ fn aggregate_partition<'a>(
     for group in groups {
         let person_events = &mut events[group.event_end - group.event_count..group.event_end];
         let person_clicks = &mut clicks[group.click_end - group.click_count..group.click_end];
-        person_events.sort_unstable_by_key(|event| event.time);
         person_clicks.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| b.id.cmp(a.id)));
 
         sessionize(person_events, &mut users, &mut sessions, &mut categories);
@@ -374,65 +371,155 @@ fn aggregate_partition<'a>(
     (users, campaigns)
 }
 
+#[derive(Clone, Copy)]
+struct EventSpan {
+    start: i64,
+    end: i64,
+    count: i64,
+    revenue: i64,
+}
+
+struct TimeBucket {
+    span: EventSpan,
+    categories: Vec<(u32, i64)>,
+}
+
+fn event_buckets(events: &[Event<'_>]) -> Option<Vec<TimeBucket>> {
+    if events.len() < 8192 {
+        return None;
+    }
+    let (first, last) = events
+        .iter()
+        .fold((i64::MAX, i64::MIN), |(first, last), event| {
+            (first.min(event.time), last.max(event.time))
+        });
+    let first_bucket = first.div_euclid(SESSION_GAP);
+    let count = (last.div_euclid(SESSION_GAP) - first_bucket + 1) as usize;
+    if count > events.len() / 8 {
+        return None;
+    }
+    let mut buckets: Vec<_> = (0..count)
+        .map(|_| TimeBucket {
+            span: EventSpan {
+                start: i64::MAX,
+                end: i64::MIN,
+                count: 0,
+                revenue: 0,
+            },
+            categories: Vec::new(),
+        })
+        .collect();
+    for event in events {
+        let index = (event.time.div_euclid(SESSION_GAP) - first_bucket) as usize;
+        let bucket = &mut buckets[index];
+        bucket.span.start = bucket.span.start.min(event.time);
+        bucket.span.end = bucket.span.end.max(event.time);
+        bucket.span.count += 1;
+        if event.category != NO_PURCHASE {
+            let cents = i64::from(event.price);
+            bucket.span.revenue += cents;
+            if let Some((_, total)) = bucket
+                .categories
+                .iter_mut()
+                .find(|(id, _)| *id == event.category)
+            {
+                *total += cents;
+            } else {
+                bucket.categories.push((event.category, cents));
+            }
+        }
+    }
+    Some(buckets)
+}
+
 fn sessionize<'a>(
-    mut events: &[Event<'a>],
+    events: &mut [Event<'a>],
     users: &mut Vec<UserDay<'a>>,
     sessions: &mut Vec<Session>,
     categories: &mut FxHashMap<u32, i64>,
 ) {
     let person = events[0].person;
-    let mut day_stats = UserDay {
+    if let Some(buckets) = event_buckets(events) {
+        // The first and last timestamps in a half-hour bucket are closer than
+        // the session gap. Only the real gap between occupied buckets matters.
+        let spans = buckets
+            .into_iter()
+            .filter(|bucket| bucket.span.count != 0)
+            .map(|bucket| (bucket.span, bucket.categories));
+        sessionize_spans(person, spans, users, sessions, categories);
+    } else {
+        events.sort_unstable_by_key(|event| event.time);
+        let spans = events.iter().map(|event| {
+            let revenue = i64::from(event.price);
+            (
+                EventSpan {
+                    start: event.time,
+                    end: event.time,
+                    count: 1,
+                    revenue,
+                },
+                (event.category != NO_PURCHASE).then_some((event.category, revenue)),
+            )
+        });
+        sessionize_spans(person, spans, users, sessions, categories);
+    }
+}
+
+fn sessionize_spans<'a, C: IntoIterator<Item = (u32, i64)>>(
+    person: &'a [u8],
+    mut spans: impl Iterator<Item = (EventSpan, C)>,
+    users: &mut Vec<UserDay<'a>>,
+    sessions: &mut Vec<Session>,
+    categories: &mut FxHashMap<u32, i64>,
+) {
+    let first = spans.next().unwrap();
+    let mut latest = first.0.start;
+    let mut session = Session {
+        start: latest,
+        day: utc_day(latest),
+        revenue: 0,
+    };
+    let mut day = new_day(person, session.day);
+    for (span, amounts) in std::iter::once(first).chain(spans) {
+        if span.start - latest > SESSION_GAP {
+            sessions.push(session);
+            day.sessions += 1;
+            session = Session {
+                start: span.start,
+                day: utc_day(span.start),
+                revenue: 0,
+            };
+            if session.day != day.day {
+                day.top_category = top_category(categories);
+                categories.clear();
+                users.push(day);
+                day = new_day(person, session.day);
+            }
+        }
+        latest = span.end;
+        day.events += span.count;
+        day.revenue += span.revenue;
+        session.revenue += span.revenue;
+        for (category, cents) in amounts {
+            *categories.entry(category).or_default() += cents;
+        }
+    }
+    sessions.push(session);
+    day.sessions += 1;
+    day.top_category = top_category(categories);
+    categories.clear();
+    users.push(day);
+}
+
+fn new_day(person: &[u8], day: i32) -> UserDay<'_> {
+    UserDay {
         person,
-        day: utc_day(events[0].time),
+        day,
         sessions: 0,
         events: 0,
         revenue: 0,
         top_category: None,
-    };
-    while let Some(first) = events.first() {
-        let start = first.time;
-        let day = utc_day(start);
-        if day != day_stats.day {
-            day_stats.top_category = top_category(categories);
-            categories.clear();
-            users.push(day_stats);
-            day_stats = UserDay {
-                person,
-                day,
-                sessions: 0,
-                events: 0,
-                revenue: 0,
-                top_category: None,
-            };
-        }
-        let mut previous = start;
-        let mut end = 0;
-        let mut revenue = 0;
-        for event in events {
-            if event.time - previous > SESSION_GAP {
-                break;
-            }
-            previous = event.time;
-            end += 1;
-            if event.category != NO_PURCHASE {
-                let cents = i64::from(event.price);
-                revenue += cents;
-                *categories.entry(event.category).or_default() += cents;
-            }
-        }
-        day_stats.sessions += 1;
-        day_stats.events += end as i64;
-        day_stats.revenue += revenue;
-        sessions.push(Session {
-            start,
-            day,
-            revenue,
-        });
-        events = &events[end..];
     }
-    day_stats.top_category = top_category(categories);
-    categories.clear();
-    users.push(day_stats);
 }
 
 fn top_category(categories: &FxHashMap<u32, i64>) -> Option<u32> {
@@ -505,5 +592,65 @@ fn count_interval(
         let count = remaining.partition_point(|session| session.day == day);
         campaigns.entry((campaign, day)).or_default().assists += count as i64;
         remaining = &remaining[count..];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DAY, Event, FxHashMap, NO_PURCHASE, SESSION_GAP, event_buckets, sessionize};
+
+    #[test]
+    fn dense_buckets_keep_real_gaps_and_the_session_start_day() {
+        let before_midnight = DAY - SESSION_GAP / 2;
+        let mut events = vec![
+            Event {
+                person: b"shopper",
+                time: before_midnight,
+                price: 0,
+                category: NO_PURCHASE,
+            };
+            8192
+        ];
+        events[0].price = 100;
+        events[0].category = 2;
+        events.push(Event {
+            time: before_midnight + SESSION_GAP,
+            price: 100,
+            category: 1,
+            ..events[0]
+        });
+        events.push(Event {
+            time: before_midnight + SESSION_GAP * 2 + 1,
+            price: 0,
+            category: NO_PURCHASE,
+            ..events[0]
+        });
+        let end = events.len() - 1;
+        events.swap(0, end);
+        assert!(event_buckets(&events).is_some());
+
+        let mut users = Vec::new();
+        let mut sessions = Vec::new();
+        sessionize(
+            &mut events,
+            &mut users,
+            &mut sessions,
+            &mut FxHashMap::default(),
+        );
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            (sessions[0].start, sessions[0].day, sessions[0].revenue),
+            (before_midnight, 0, 200)
+        );
+        assert_eq!(sessions[1].start, before_midnight + SESSION_GAP * 2 + 1);
+        assert_eq!(users.len(), 2);
+        assert_eq!(
+            (users[0].day, users[0].events, users[0].top_category),
+            (0, 8193, Some(1))
+        );
+        assert_eq!(
+            (users[1].day, users[1].events, users[1].top_category),
+            (1, 1, None)
+        );
     }
 }

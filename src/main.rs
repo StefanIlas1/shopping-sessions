@@ -67,8 +67,18 @@ fn main() -> Result<()> {
         }
         "dedup" => {
             let (events, clicks) = rayon::join(
-                || unique_rows::<_, _, 7>(&events, Some(3), |_, _| Some(())).len(),
-                || unique_rows::<_, _, 4>(&clicks, None, |_, _| Some(())).len(),
+                || {
+                    unique_rows::<_, _, 7>(&events, Some(3), |_, _| Some(()))
+                        .iter()
+                        .map(Vec::len)
+                        .sum::<usize>()
+                },
+                || {
+                    unique_rows::<_, _, 4>(&clicks, None, |_, _| Some(()))
+                        .iter()
+                        .map(Vec::len)
+                        .sum::<usize>()
+                },
             );
             eprintln!("dedup events={events} clicks={clicks}");
             report("scan_and_dedup");
